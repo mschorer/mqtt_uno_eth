@@ -1,38 +1,40 @@
 /*
- * Send temperature from ESP8266 with multiple DS18B20 to MQTT server.
- * A simple Sketch to read the Temperature from multiple DS18B20 and publish them to a MQTT-Server using a ESP8266. 
- * Compiles in the Arduino IDE for the ESP8266
- * 
- * For deep sleep support uncomment 'deep sleep' part
- * For DHT22 support uncomment 'dht22' part
- * OTA currently does not work.
- * 
- * 
- */
+  Send temperature from Arduino Uno with multiple DS18B20 to MQTT server.
+  Try to reuse as much as possible from ESP8266 code
+
+*/
 #include <PubSubClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 // #include <Streaming.h>
 #include <SPI.h>
 #include <Ethernet.h>
+//#include <Dns.h>
+//#include <Adafruit_Sensor.h>
+//#include <Adafruit_BME280.h>
 
-#define SW_VERSION  "ardu_0.96"
+#include <EEPROM.h>
+
+#define SW_VERSION  "ardu_0.111"
+
+#define SLEEP_DELAY_IN_SECONDS  60
+//---------------------------
 
 // the media access control (ethernet hardware) address for the shield:
-byte mac[] = { 0x90, 0xA2D, 0xDA, 0x0D, 0x4C, 0x56 };  
-//the IP address for the shield:
-byte ip[] = { 10, 0, 0, 177 };    
+const byte mac[] = { 0x90, 0xA2D, 0xDA, 0x0D, 0x4C, 0x56 };
 
-byte sensors = 0;
-byte sensorIDs[ 32][8];
+union busAddress {
+  byte raw[8];
+  long data[2];
+};
 
-/* dht22
-#include <DHT.h>
-*/
+#define RTC_BLOCK_OFFSET 496
+struct rtcMem {
+  long timestamp;
+  long crc32;
+};
 
-// deep sleep
-#define SLEEP_DELAY_IN_SECONDS  30
-//
+rtcMem rtcCache;
 
 // data cable connected to D4 pin
 #define ONE_WIRE_BUS 2
@@ -40,67 +42,127 @@ byte sensorIDs[ 32][8];
 #define FALSE 0
 #define TRUE 1
 
-// dht22
-/*
-// data cable connected to D3
-#define DHTPIN D3
-#define DHTTYPE DHT22
-char tString[6];
-char hString[6];
-long previousMillis = 0;
-long interval = 60000;
-*/
-
 //mqtt
 const char* mqtt_server = "pidrei.fritz.box";
 const char* mqtt_username = "mqtt";
 const char* mqtt_password = "mqtt";
-const char* node = "uno";
 
-// ora
-/*
-ESP8266WebServer httpServer(80);
-ESP8266HTTPUpdateServer httpUpdater;
-*/
-//dht22
-/*
-DHT dht(DHTPIN, DHTTYPE, 20);
-*/
+char nodeName[32] = "";
+char nodeId[24] = "";
+
+//---------------------------
 
 EthernetClient ethClient;
 PubSubClient client(ethClient);
+//DNSClient dns;
+IPAddress resolvedIP;
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature DS18B20(&oneWire);
 
-String mqttTopic = "iot/temp";
+//#define BME_I2C_ADDR 0x76
+//Adafruit_BME280 bme; // I2C
+//bool bmeAvailable = FALSE;
 
-int busScans = 0;
+const char* mqttTopicTemp = "iot/temp";
+const char* mqttTopicHumid = "iot/humidity";
+const char* mqttTopicPAtmo = "iot/atmosphere";
+
+//---------------------------
+
+uint32_t calculateCRC32(const uint8_t *data, size_t length) {
+  uint32_t crc = 0xffffffff;
+  while (length--) {
+    uint8_t c = *data++;
+    for (uint32_t i = 0x80; i > 0; i >>= 1) {
+      bool bit = crc & 0x80000000;
+      if (c & i) {
+        bit = !bit;
+      }
+      crc <<= 1;
+      if (bit) {
+        crc ^= 0x04c11db7;
+      }
+    }
+  }
+  return crc;
+}
 
 void setup_network() {
-  if (Ethernet.begin(mac) == 0) {
+
+  while(Ethernet.begin(mac) == 0) {
     Serial.println("Failed to configure Ethernet using DHCP");
     if (Ethernet.hardwareStatus() == EthernetNoHardware) {
       Serial.println("Ethernet shield was not found.  Sorry, can't run without hardware. :(");
     } else if (Ethernet.linkStatus() == LinkOFF) {
       Serial.println("Ethernet cable is not connected.");
     }
-    // no point in carrying on, so do nothing forevermore:
-    while (true) {
-      delay(5);
-      Serial.println( "no eth connected.");
-    }
+
+    delay(5000);
   }
 
+  sprintf( nodeId, "%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  sprintf( nodeName, "uno_%s", nodeId);
+  Serial.print( "name [");
+  Serial.print( nodeName);
+  Serial.print( "]");
+
   // print your local IP address:
-  Serial.print("My IP address: ");
+  Serial.print(" @");
   Serial.println(Ethernet.localIP());
+  /*
+    Serial.print("DNS #1 ");
+    Ethernet.dnsServerIP().printTo(Serial);
+    Serial.println();
+
+    dns.begin(Ethernet.dnsServerIP());
+    if (!dns.getHostByName( mqtt_server, resolvedIP)) {
+      Serial.print("DNS lookup [");
+      Serial.print( mqtt_server);
+      Serial.print("] [");
+      Serial.print( resolvedIP);
+      Serial.println("] failed.  Rebooting...");
+      Serial.flush();
+      //ESP.reset();
+    }
+  */
+  resolvedIP = IPAddress( 192, 168, 1, 71);
+  Serial.print("mqtt: ");
+  Serial.print( mqtt_server);
+  Serial.print(" @");
+  Serial.println(resolvedIP);
+
+  pinMode(A0, INPUT);
 
   // dht22
   /*
-  dht.begin();
+    dht.begin();
   */
 }
+
+void updateSettings() {
+    rtcCache.crc32 = calculateCRC32( (uint8_t *)&rtcCache.timestamp, 4);
+    EEPROM.put( RTC_BLOCK_OFFSET, rtcCache);
+    //ESP.rtcUserMemoryWrite( RTC_BLOCK_OFFSET, (uint32_t*)&rtcCache, sizeof(rtcCache));
+}
+
+byte retrieveSettings() {
+  //ESP.rtcUserMemoryRead( RTC_BLOCK_OFFSET, (uint32_t*)&rtcCache, sizeof(rtcCache));
+  EEPROM.get( RTC_BLOCK_OFFSET, rtcCache);
+  uint32_t crcNow = calculateCRC32( (uint8_t *)&rtcCache.timestamp, 4);
+
+  if ( rtcCache.crc32 != crcNow) {
+    Serial.print( "crc error [");
+    Serial.print( rtcCache.crc32);
+    Serial.print( "] != [");
+    Serial.print( crcNow);
+    Serial.println( "] resetting time");
+
+    return FALSE;
+  } else return TRUE;
+}
+
+//---------------------------
 
 void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print("Message arrived [");
@@ -112,26 +174,57 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.println();
 }
 
+//---------------------------
+
 void setup() {
   // setup serial port
   Serial.begin(115200);
 
-  // setup WiFi
+  if ( ! retrieveSettings()) {
+    rtcCache.timestamp = 0;
+    updateSettings();
+  }
+
+  Serial.print( "time [");
+  Serial.print( rtcCache.timestamp);
+  Serial.println( "]");
+
+  // setup Ethernet
   setup_network();
-  client.setServer(mqtt_server, 1883);
+  client.setServer( resolvedIP, 1883);
   client.setCallback(callback);
 
- // ota
- /*
-  MDNS.begin(host);
-  httpUpdater.setup(&httpServer);
-  httpServer.begin();
-  MDNS.addService("http", "tcp", 80);
-  Serial.printf("HTTPUpdateServer ready! Open http://%s.local/update in your browser\n", host);
- */
+  // ota
+  /*
+    MDNS.begin(host);
+    httpUpdater.setup(&httpServer);
+    httpServer.begin();
+    MDNS.addService("http", "tcp", 80);
+    Serial.printf("HTTPUpdateServer ready! Open http://%s.local/update in your browser\n", host);
+  */
   // setup OneWire bus
   DS18B20.begin();
+
+  /*
+    if ( ! bme.begin( BME_I2C_ADDR, &Wire)) {
+      Serial.println( "Could not find a valid BME280 sensor, skipping ...");
+      bmeAvailable = FALSE;
+    } else {
+    bmeAvailable = TRUE;
+    // weather monitoring
+    Serial.println("-- Weather Station Scenario --");
+    Serial.println("forced mode, 1x temperature / 1x humidity / 1x pressure oversampling,");
+    Serial.println("filter off");
+    bme.setSampling(Adafruit_BME280::MODE_FORCED,
+                    Adafruit_BME280::SAMPLING_X1, // temperature
+                    Adafruit_BME280::SAMPLING_X1, // pressure
+                    Adafruit_BME280::SAMPLING_X1, // humidity
+                    Adafruit_BME280::FILTER_OFF   );
+    }
+  */
 }
+
+//---------------------------
 
 void networkLoop() {
   switch (Ethernet.maintain()) {
@@ -167,30 +260,78 @@ void networkLoop() {
   }
 }
 
+void publishTopic( char* mqttTopic, char* sensorID, char* sensorName, double value) {
+  char topic[32];
+  char msg[64];
+  char sensorData[6];
+
+  dtostrf(value, 4, 2, sensorData);
+  sprintf( topic, "%s/%s", mqttTopic, sensorID);
+  sprintf( msg, "{ \"node\":\"%s\", \"ts\":%ld, \"%s\":%s }", nodeName, rtcCache.timestamp, sensorName, sensorData);
+
+  Serial.print("node [");
+  Serial.print( topic);
+  Serial.print("] = [");
+  Serial.print( msg);
+  Serial.print("] ");
+
+  if ( reconnect()) {
+    if ( client.publish( topic, msg, TRUE)) {
+      Serial.println( "pub ok" );
+    } else {
+      Serial.println("pub err");
+    }
+  } else {
+    Serial.print( " err[");
+    Serial.print( client.state());
+    Serial.println( "]");
+  }
+}
+
+void publishNodeSummary( int devCount) {
+  char topic[32];
+  char msg[100];
+  
+  sprintf( topic, "iot/nodes/%s", nodeName);
+  sprintf( msg, "{ \"name\":\"%s\", \"version\":\"%s\", \"ticks\":%ld, \"devices\":%i }", nodeName, SW_VERSION, rtcCache.timestamp, devCount);
+
+  Serial.print("node [");
+  Serial.print( topic);
+  Serial.print("] = [");
+  Serial.print( msg);
+  Serial.print("] ");
+
+  if ( reconnect()) {
+    if ( client.publish( topic, msg, TRUE)) {
+      Serial.println( "pub ok" );
+    } else {
+      Serial.println("pub err");
+    }
+  } else {
+    Serial.print( " err[");
+    Serial.print( client.state());
+    Serial.println( "]");
+  }
+}
+
 bool reconnect() {
   byte i = 3;
   int state = client.state();
-  /*
-  Serial.print( "state [");
-  Serial.print( state);
-  Serial.print( "] [");
-  Serial.print( client.connected());
-  Serial.println( "]");
-  */
+
   // Loop until we're reconnected
   while (( state != MQTT_CONNECTED) && (i > 0)) {
     Serial.print("mqtt[");
     Serial.print( state);
     Serial.print( "] ");
 
-    if (client.connect( node)) {
+    if (client.connect( nodeName)) {
       Serial.print("ok ");
       client.loop();
 
       client.subscribe("iot/cmd/#");
       break;
     } else {
-            delay( 1000);
+      delay( 1000);
       state = client.state();
     }
     i--;
@@ -200,80 +341,109 @@ bool reconnect() {
 }
 
 byte crcCheck( byte* buf, byte maxIdx) {
-    byte crc = OneWire::crc8( buf, maxIdx);
-    if ( crc != buf[maxIdx]) {
-      Serial.print("CRC err ");
-      Serial.print( maxIdx, DEC);
-      Serial.print(" ");
-      Serial.print( crc, HEX);
-      Serial.print( " != ");
-      Serial.println( buf[maxIdx], HEX);
-      return TRUE;
-    }
+  byte crc = OneWire::crc8( buf, maxIdx);
+  if ( crc != buf[maxIdx]) {
+    Serial.print("CRC err ");
+    Serial.print( maxIdx, DEC);
+    Serial.print(" ");
+    Serial.print( crc, HEX);
+    Serial.print( " != ");
+    Serial.println( buf[maxIdx], HEX);
+    return TRUE;
+  }
 
-    return FALSE;
+  return FALSE;
 }
 
-union busAddress {
-  byte raw[8];
-  long data[2];
-};
+//---------------------------
 
 void loop() {
-  busAddress addr;
   byte i;
   byte present = 0;
   byte type_s;
   byte data[12];
   byte devCount = 0;
-  char sensorId[32];
-  String sensorData = "";
+  byte sensor = 0;
+  char sensorId[16];
+  char sensorType[8];
+  char hex[3];
+  
+  byte sensors = 0;
+  busAddress sensorIDs[ 16];
+
+  /*
+    if ( bmeAvailable)
+    bme.takeForcedMeasurement();
+  */
 
   //Loop through all DS1820
-  
-  while( oneWire.search( addr.raw)) { 
+  sensors = 0;
+  while ( oneWire.search( sensorIDs[sensors].raw)) {
     networkLoop();
-    client.loop();
- 
+
     //Topic is built from a static String plus the ID of the DS18B20
-    if ( crcCheck( addr.raw, 7)) {
-        continue;
+    if ( crcCheck( sensorIDs[sensors].raw, 7)) {
+      continue;
     }
 
     // the first ROM byte indicates which chip
-    switch (addr.raw[0]) {
+    switch (sensorIDs[sensors].raw[0]) {
       case 0x10:
-        //Serial.println("  Chip = DS18S20");  // or old DS1820
+        strcpy( sensorType, "DS18S20");  // or old DS1820
         type_s = 1;
         break;
       case 0x28:
-        //Serial.println("  Chip = DS18B20");
+        strcpy( sensorType, "DS18B20");
         type_s = 0;
         break;
       case 0x22:
-        //Serial.println("  Chip = DS1822");
+        strcpy( sensorType, "DS1822");
         type_s = 0;
         break;
       default:
-        Serial.println("Device is not a DS18x20 family device.");
+        strcpy( sensorType, "not a DS18x20 family device");
         return;
-    } 
-  
+    }
+
     oneWire.reset();
-    oneWire.select( addr.raw);
+    oneWire.select( sensorIDs[sensors].raw);
     oneWire.write( 0x44, 1);        // start conversion, with parasite power on at the end
-    
-    delay(1000);     // maybe 750ms is enough, maybe not
+
+    sensorId[0] = 0;
+    for ( byte x = 0; x < 8; x++) {
+      sprintf( hex, "%02x", sensorIDs[sensors].raw[x]);
+      strcat( sensorId, hex);
+    }
+
+    Serial.print( "found: [");
+    Serial.print( sensorType);
+    Serial.print( "] @ [");
+    Serial.print( sensorId);
+    Serial.println( "]");
+
     // we might do a oneWire.depower() here, but the reset will take care of it.
-    
+
     present = oneWire.reset();
-    oneWire.select( addr.raw);    
+
+    sensors++;
+  }
+  oneWire.reset_search();
+
+  Serial.print( "found #[");
+  Serial.print( sensors);
+  Serial.println( "] oneWire sensors");
+
+  delay(1000);     // maybe 750ms is enough, maybe not
+
+  sensor = 0;
+  while ( sensor < sensors) {
+    oneWire.select( sensorIDs[sensor].raw);
     oneWire.write( 0xBE);         // Read Scratchpad
-  
+
     /*
-    Serial.print("  Data = ");
-    Serial.print(present, HEX);
-    Serial.print(" ");
+      Serial.print("  Data = ");
+      Serial.print(present, HEX);
+      Serial.print(" ");
     */
     for ( i = 0; i < 9; i++) {           // we need 9 bytes
       data[i] = oneWire.read();
@@ -297,93 +467,60 @@ void loop() {
       else if (cfg == 0x40) raw = raw & ~1; // 11 bit res, 375 ms
       //// default is 12 bit resolution, 750 ms conversion time
     }
-  
+
     //convert RAW Temperature to String
-    String raw_temp = String(raw, DEC);
+    //String raw_temp = String(raw, DEC);
     //convert RAW Temperature to celsius
     double temp = raw * 0.0625;
-    //convert to string
-    char tempString[6];
-    dtostrf(temp, 2, 2, tempString);
-    sensorData = tempString;
 
     sensorId[0] = 0;
-    char hex[20];
-    for( byte x=0; x < 8; x++) {
-      sprintf( hex, "%02x", addr.raw[x]);
+    for ( byte x = 0; x < 8; x++) {
+      sprintf( hex, "%02x", sensorIDs[sensor].raw[x]);
       strcat( sensorId, hex);
     }
 
-    String fullTopic = String( mqttTopic+"/"+sensorId);
-    String mqttMessage = String( "{ ");
-    mqttMessage += "\"node\":\""+String( node)+"\", ";
-    mqttMessage += "\"ts\":"+String(busScans)+", ";
-    mqttMessage += "\"temperature\":"+sensorData;
-    mqttMessage += " }";
-
-    Serial.print("sensor [");
-    Serial.print( fullTopic);
-    Serial.print("] = [");
-    Serial.print(  mqttMessage   );
-    Serial.print("] ");    
-
-    if ( busScans || temp != 85.0) {
-      if ( reconnect()) {
-        if (client.publish( fullTopic.c_str(), mqttMessage.c_str(), TRUE)) {
-          Serial.println( "pub ok" );
-        }
-        else {
-          Serial.println("pub err");
-        }
-      } else {
-        Serial.println("recon ");
-      }
+    if (rtcCache.timestamp || temp != 85.0) {
+      publishTopic( mqttTopicTemp, sensorId, "temperature", temp);
       client.loop();
     } else {
       Serial.println("skip");
     }
 
     devCount++;
+    sensor++;
   }
-  oneWire.reset_search();
 
-  if (devCount > 0) busScans++;
-  byte gap = SLEEP_DELAY_IN_SECONDS - devCount;
-
-  String fullTopic = String( "iot/nodes/")+String(node);
-  String mqttMessage = String( "{ ");
-  mqttMessage += "\"name\":\""+String(node)+"\", ";
-  mqttMessage += "\"version\":\""+String( SW_VERSION)+"\", ";
-  mqttMessage += "\"ticks\":"+String(busScans)+", ";
-  mqttMessage += "\"devices\":"+String(devCount)+" ";
-  mqttMessage += "}";
-
-  Serial.print("node [");
-  Serial.print( fullTopic);
-  Serial.print("] = [");
-  Serial.print(  mqttMessage   );
-  Serial.print("] ");    
-
-  if ( reconnect()) {
-    if ( client.publish( fullTopic.c_str(), mqttMessage.c_str(), TRUE)) {
-      Serial.println( "pub ok" );
-    } else {
-      Serial.println("pub err");
+  /*
+    if ( bmeAvailable) {
+    publishTopic( mqttTopicTemp, "bme_"+String( nodeId), "temperature", bme.readTemperature());
+    devCount++;
+    publishTopic( mqttTopicPAtmo, "bme_"+String( nodeId), "pressure", bme.readPressure() / 100.0F);
+    devCount++;
+    publishTopic( mqttTopicHumid, "bme_"+String( nodeId), "humidity", bme.readHumidity());
+    devCount++;
     }
-  } else {
-    Serial.print( " err[");
-    Serial.print( client.state());
-    Serial.println( "]");
+  */
+
+  Serial.print( "dev #");
+  Serial.println( devCount);
+
+  if (devCount > 0) rtcCache.timestamp++;
+  byte gap = SLEEP_DELAY_IN_SECONDS;
+
+  publishNodeSummary( devCount);
+
+  if ( 0 == (rtcCache.timestamp % 15)) {
+    updateSettings();
   }
-  Serial.print( "dev #"+String(devCount));
-  Serial.print( " sleep ");
+
+  Serial.print( "sleep ");
   Serial.print( gap);
   Serial.println( "s.");
 
-  while( gap > 0) {
-    delay( 1000);  
+  while ( gap > 0) {
     client.loop();
     networkLoop();
+    delay( 1000);
     gap--;
-  }  
+  }
 }
